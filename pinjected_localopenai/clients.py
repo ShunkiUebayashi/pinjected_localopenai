@@ -6,10 +6,10 @@ from pinjected import instance
 
 
 @instance
-def async_openai_client(openai_api_key, openai_organization) -> AsyncOpenAI:
+def async_openai_client(openai_api_key, base_url) -> AsyncOpenAI:
     return AsyncOpenAI(
         api_key=openai_api_key,
-        organization=openai_organization
+        base_url=base_url
     )
 
 

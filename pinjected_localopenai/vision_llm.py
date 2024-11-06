@@ -2,12 +2,13 @@ import asyncio
 import base64
 import io
 import json
+import os  # 追加: 環境変数を取得するため
 import re
 from asyncio import Lock
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, Callable
+from typing import Any, Literal, Callable, Optional
 
 import openai.types.chat
 import pandas as pd
@@ -19,8 +20,7 @@ from math import ceil
 from openai import AsyncOpenAI, RateLimitError, APITimeoutError, APIConnectionError
 from openai.types.chat import ChatCompletion
 from pinjected import injected, Injected, instances, instance
-from pydantic import BaseModel
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 
 class ChatCompletionWithCost(BaseModel):
@@ -36,7 +36,7 @@ def chat_completion_costs_subject():
 
 
 def to_content(img: Image, detail: Literal["auto", "low", "high"] = 'auto'):
-    # convert Image into jpeg bytes
+    # ImageをJPEGバイトに変換
     jpg_bytes = io.BytesIO()
     img.convert('RGB').save(jpg_bytes, format='jpeg', quality=95)
     b64_image = base64.b64encode(jpg_bytes.getvalue()).decode('utf-8')
@@ -49,6 +49,7 @@ def to_content(img: Image, detail: Literal["auto", "low", "high"] = 'auto'):
             detail=detail
         )
     }
+
 
 @dataclass
 class UsageEntry:
@@ -70,12 +71,6 @@ class RateLimitManager(BaseModel):
         if await self.ready(approx_tokens):
             pass
         else:
-            # wait for some time or condition, but who checks the condition?
-            # a distinct loop, or loop here?
-            # 1. check if we need to wait
-            # 2. check if someone else is waiting with loop
-            # 3. if not use looping to wait
-            # Currently, everyone waits with loops
             while not await self.ready(approx_tokens):
                 await asyncio.sleep(1)
 
@@ -92,7 +87,6 @@ class RateLimitManager(BaseModel):
 
     async def remaining_calls(self):
         return self.max_calls - len(self.call_history)
-
 
     async def _current_usage(self):
         t = pd.Timestamp.now()
@@ -111,64 +105,22 @@ class RateLimitKey(BaseModel):
 
 
 class BatchQueueLimits(BaseModel):
-    tpm: int = Field(None, alias="TPM")
-    rpm: int = Field(None, alias="RPM")
-    tpd: int = Field(None, alias="TPD")
-    images_per_minute: int = None
+    tpm: Optional[int] = Field(None, alias="TPM")
+    rpm: Optional[int] = Field(None, alias="RPM")
+    tpd: Optional[int] = Field(None, alias="TPD")
+    images_per_minute: Optional[int] = None
 
 
 class ModelLimits(BaseModel):
-    modeltoken_limits: int = None
-    request_limits: int = None
-    other_limits: int = None
-    batch_queue_limits: BatchQueueLimits
+    modeltoken_limits: Optional[int] = None
+    request_limits: Optional[int] = None
+    other_limits: Optional[int] = None
+    batch_queue_limits: Optional[BatchQueueLimits] = None
 
 
 class Limits(BaseModel):
-    gpt_4: ModelLimits = Field(None, alias="gpt-4")
-    gpt_3_5_turbo: ModelLimits = Field(None, alias="gpt-3.5-turbo")
-    gpt_4_turbo: ModelLimits = Field(None, alias="gpt-4-turbo")
-    text_embedding_3_small: ModelLimits = Field(None, alias="text-embedding-3-small")
-    dall_e_3: ModelLimits = Field(None, alias="dall-e-3")
-    tts_1: ModelLimits = Field(None, alias="tts-1")
-    whisper_1: ModelLimits = Field(None, alias="whisper-1")
-
-
-personal_limits = Limits(
-    gpt_4=ModelLimits(
-        modeltoken_limits=10000000,
-        request_limits=10000,
-        other_limits=1500000000,
-        batch_queue_limits=BatchQueueLimits(tpm=300000, rpm=10000, tpd=45000000)
-    ),
-    gpt_3_5_turbo=ModelLimits(
-        modeltoken_limits=2000000,
-        request_limits=10000,
-        other_limits=300000000,
-        batch_queue_limits=BatchQueueLimits(tpm=2000000, rpm=10000, tpd=300000000)
-    ),
-    gpt_4_turbo=ModelLimits(
-        modeltoken_limits=2000000,
-        request_limits=10000,
-        other_limits=300000000,
-        batch_queue_limits=BatchQueueLimits(tpm=2000000, rpm=10000, tpd=300000000)
-    ),
-    text_embedding_3_small=ModelLimits(
-        modeltoken_limits=10000000,
-        request_limits=10000,
-        other_limits=4000000000,
-        batch_queue_limits=BatchQueueLimits(tpm=10000000, rpm=10000, tpd=4000000000)
-    ),
-    dall_e_3=ModelLimits(
-        batch_queue_limits=BatchQueueLimits(images_per_minute=50)
-    ),
-    tts_1=ModelLimits(
-        batch_queue_limits=BatchQueueLimits(rpm=500)
-    ),
-    whisper_1=ModelLimits(
-        batch_queue_limits=BatchQueueLimits(rpm=500)
-    )
-)
+    llava_1_6_mistral: ModelLimits = Field(..., alias="llava-1.6-mistral")
+    llava_1_6_vicuna: ModelLimits = Field(..., alias="llava-1.6-vicuna")
 
 
 class ModelPricing(BaseModel):
@@ -177,22 +129,8 @@ class ModelPricing(BaseModel):
 
 
 class PricingModel(BaseModel):
-    gpt_4_turbo: ModelPricing = ModelPricing(input_cost=0.0100, output_cost=0.0300)
-    gpt_4_turbo_2024_04_09: ModelPricing = ModelPricing(input_cost=0.0100, output_cost=0.0300)
-    gpt_4: ModelPricing = ModelPricing(input_cost=0.0300, output_cost=0.0600)
-    gpt_4_32k: ModelPricing = ModelPricing(input_cost=0.0600, output_cost=0.1200)
-    gpt_4_0125_preview: ModelPricing = ModelPricing(input_cost=0.0100, output_cost=0.0300)
-    gpt_4_1106_preview: ModelPricing = ModelPricing(input_cost=0.0100, output_cost=0.0300)
-    gpt_4_vision_preview: ModelPricing = ModelPricing(input_cost=0.0100, output_cost=0.0300)
-    gpt_3_5_turbo_1106: ModelPricing = ModelPricing(input_cost=0.0010, output_cost=0.0020)
-    gpt_3_5_turbo_0613: ModelPricing = ModelPricing(input_cost=0.0015, output_cost=0.0020)
-    gpt_3_5_turbo_16k_0613: ModelPricing = ModelPricing(input_cost=0.0030, output_cost=0.0040)
-    gpt_3_5_turbo_0301: ModelPricing = ModelPricing(input_cost=0.0015, output_cost=0.0020)
-    davinci_002: ModelPricing = ModelPricing(input_cost=0.0020, output_cost=0.0020)
-    babbage_002: ModelPricing = ModelPricing(input_cost=0.0004, output_cost=0.0004)
-    gpt_4o: ModelPricing = ModelPricing(input_cost=0.0025, output_cost=0.0150)
-    gpt_4o_2024_05_13: ModelPricing = ModelPricing(input_cost=0.0025, output_cost=0.0150)
-    gpt_4o_2024_08_06: ModelPricing = ModelPricing(input_cost=0.0025, output_cost=0.0150)
+    llava_1_6_mistral: ModelPricing = ModelPricing(input_cost=0.0050, output_cost=0.0150)
+    llava_1_6_vicuna: ModelPricing = ModelPricing(input_cost=0.0060, output_cost=0.0180)
 
 
 pricing_model = PricingModel()
@@ -200,8 +138,8 @@ pricing_model = PricingModel()
 
 @instance
 def openai_rate_limit_managers(
-        openai_api_key,
-        openai_organization,
+        openai_api_key: str,
+        openai_organization: str,
         openai_rate_limits: Limits
 ) -> dict[Any, RateLimitManager]:
     managers = dict()
@@ -213,8 +151,8 @@ def openai_rate_limit_managers(
             request_type="completion"
         )
         managers[key] = RateLimitManager(
-            max_tokens=limits.modeltoken_limits,
-            max_counts=limits.request_limits,
+            max_tokens=limits.modeltoken_limits or 1000000,  # デフォルト値を設定
+            max_calls=limits.request_limits or 1000,          # デフォルト値を設定
             duration=pd.Timedelta("1 minute"),
         )
     return managers
@@ -244,7 +182,7 @@ async def a_repeat_for_rate_limit(logger, /, task):
             await asyncio.sleep(10)
 
 
-def resize(width, height):
+def resize(width: int, height: int) -> tuple[int, int]:
     if width > 1024 or height > 1024:
         if width > height:
             height = int(height * 1024 / width)
@@ -256,7 +194,7 @@ def resize(width, height):
 
 
 @injected
-def openai_count_image_tokens(width: int, height: int):
+def openai_count_image_tokens(width: int, height: int) -> int:
     width, height = resize(width, height)
     h = ceil(height / 512)
     w = ceil(width / 512)
@@ -270,7 +208,9 @@ async def a_chat_completion_to_cost(
         /,
         completion: ChatCompletion
 ) -> ChatCompletionWithCost:
-    pricing = openai_model_pricing_table[completion.model]
+    pricing = openai_model_pricing_table.get(completion.model)
+    if not pricing:
+        raise ValueError(f"Pricing information for model {completion.model} not found.")
     usage = completion.usage
     return ChatCompletionWithCost(
         src=completion,
@@ -281,10 +221,10 @@ async def a_chat_completion_to_cost(
 
 
 @instance
-def openai_model_pricing_table():
+def openai_model_pricing_table() -> dict[str, ModelPricing]:
     keys = pricing_model.dict().keys()
-    # keys = [k.replace("_", "-") for k in keys]
     return {k.replace("_", "-"): getattr(pricing_model, k) for k in keys}
+
 
 @injected
 async def a_vision_llm__openai(
@@ -295,10 +235,10 @@ async def a_vision_llm__openai(
         a_enable_cost_logging: Callable,
         /,
         text: str,
-        images: list[Image] = None,
-        model: str = "gpt-4o",
-        max_tokens=2048,
-        response_format: openai.types.chat.completion_create_params.ResponseFormat = None,
+        images: Optional[list[Image]] = None,
+        model: str = "llava-1.6-mistral",  # デフォルトモデルを変更
+        max_tokens: int = 2048,
+        response_format: Optional[dict] = None,
         detail: Literal["auto", "low", "high"] = 'auto'
 ) -> str:
     assert isinstance(async_openai_client, AsyncOpenAI)
@@ -311,16 +251,16 @@ async def a_vision_llm__openai(
     for img in images:
         assert isinstance(img, Image), f"image is not Image, but {type(img)}"
 
-    if isinstance(response_format,type) and issubclass(response_format,BaseModel):
-        API = async_openai_client.beta.chat.completions.parse
+    if isinstance(response_format, dict) and response_format.get("type") == "json_object":
+        API = async_openai_client.chat.completions.create
         def get_result(completion):
-            return completion.choices[0].message.parsed
+            return json.loads(completion.choices[0].message.content)
     else:
         API = async_openai_client.chat.completions.create
         def get_result(completion):
             return completion.choices[0].message.content
-    async def task():
 
+    async def task():
         chat_completion = await API(
             messages=[
                 {
@@ -344,10 +284,6 @@ async def a_vision_llm__openai(
 
     chat_completion = await a_repeat_for_rate_limit(task)
     return get_result(chat_completion)
-    #res = chat_completion.choices[0].message.content
-    #assert isinstance(res, str)
-    logger.info(f"{model} call result:\n{res}")
-    return res
 
 
 @instance
@@ -376,19 +312,25 @@ async def a_enable_cost_logging(
     cost_logging_state["enabled"] = True
 
 
-a_vision_llm__gpt4o = Injected.partial(a_vision_llm__openai, model="gpt-4o")
-_test_a_gpt4o: Injected = Injected.procedure(
-    a_enable_cost_logging(),
-    a_vision_llm__gpt4o("hello?"),
-    a_vision_llm__gpt4o("hello hello")
-)
-a_vision_llm__gpt4 = Injected.partial(a_vision_llm__openai, model="gpt-4-vision-preview")
-a_cached_vision_llm__gpt4o = async_cached(
-    sqlite_dict(str(Path("~/.cache/pinjected_openai/a_vision_llm__gpt4o.sqlite").expanduser()))
-)(a_vision_llm__gpt4o)
-a_cached_vision_llm__gpt4 = async_cached(
-    sqlite_dict(str(Path("~/.cache/pinjected_openai/a_vision_llm__gpt4.sqlite").expanduser()))
-)(a_vision_llm__gpt4)
+# 新しいOpenAIクライアントの設定: ローカルサーバー用
+@instance
+def async_openai_client() -> AsyncOpenAI:
+    base_url = os.getenv("OPENAI_BASE_URL", "http://localhost:8000/v1")
+    api_key = os.getenv("LOCAL_OPENAI_API_KEY", "token-abc123")  # 環境変数名を変更
+    return AsyncOpenAI(api_key=api_key, base_url=base_url)  # base_urlを設定
+
+
+# モデル名を変更して関数を部分適用
+a_vision_llm__mistral = Injected.partial(a_vision_llm__openai, model="llava-1.6-mistral")
+a_vision_llm__vicuna = Injected.partial(a_vision_llm__openai, model="llava-1.6-vicuna")
+
+# キャッシュの設定
+a_cached_vision_llm__mistral = async_cached(
+    sqlite_dict(str(Path("~/.cache/pinjected_openai/a_vision_llm__llava-1.6-mistral.sqlite").expanduser()))
+)(a_vision_llm__mistral)
+a_cached_vision_llm__vicuna = async_cached(
+    sqlite_dict(str(Path("~/.cache/pinjected_openai/a_vision_llm__llava-1.6-vicuna.sqlite").expanduser()))
+)(a_vision_llm__vicuna)
 
 
 @injected
@@ -399,15 +341,12 @@ async def a_llm__openai(
         /,
         text: str,
         model_name: str,
-        max_completion_tokens=4096,
+        max_completion_tokens: int = 4096,
 ) -> str:
     assert isinstance(async_openai_client, AsyncOpenAI)
     await a_enable_cost_logging()
 
     async def task():
-        # import tiktoken
-        # enc = tiktoken.get_encoding("cl100k_base")
-        # n_token = len(enc.encode(text))
         chat_completion = await async_openai_client.chat.completions.create(
             messages=[
                 {
@@ -433,28 +372,28 @@ async def a_llm__openai(
 
 
 @injected
-async def a_llm__gpt4_turbo(
+async def a_llm__mistral(
         a_llm__openai,
         /,
         text: str,
-        max_completion_tokens=4096
+        max_completion_tokens: int = 4096
 ) -> str:
-    return await a_llm__openai(text, max_completion_tokens=max_completion_tokens, model_name="gpt-4-turbo-preview")
+    return await a_llm__openai(text, model_name="llava-1.6-mistral", max_completion_tokens=max_completion_tokens)
 
 
-a_llm__gpt4_turbo_cached = async_cached(
-    sqlite_dict(str(Path("~/.cache/a_llm__gpt4_turbo.sqlite").expanduser()))
-)(a_llm__gpt4_turbo)
+a_llm__mistral_cached = async_cached(
+    sqlite_dict(str(Path("~/.cache/a_llm__mistral.sqlite").expanduser()))
+)(a_llm__mistral)
 
 
 @injected
-async def a_llm__gpt35_turbo(
+async def a_llm__vicuna(
         a_llm__openai,
         /,
         text: str,
-        max_completion_tokens=4096
+        max_completion_tokens: int = 4096
 ) -> str:
-    return await a_llm__openai(text, max_completion_tokens=max_completion_tokens, model_name="gpt-3.5-turbo")
+    return await a_llm__openai(text, model_name="llava-1.6-vicuna", max_completion_tokens=max_completion_tokens)
 
 
 @injected
@@ -464,15 +403,12 @@ async def a_json_llm__openai(
         a_repeat_for_rate_limit,
         /,
         text: str,
-        max_completion_tokens=4096,
-        model="gpt-4-0125-preview"
-) -> str:
+        max_completion_tokens: int = 4096,
+        model: str = "llava-1.6-mistral"  # デフォルトモデルを変更
+) -> dict:
     assert isinstance(async_openai_client, AsyncOpenAI)
 
     async def task():
-        # import tiktoken
-        # enc = tiktoken.get_encoding("cl100k_base")
-        # n_token = len(enc.encode(text))
         chat_completion = await async_openai_client.chat.completions.create(
             messages=[
                 {
@@ -499,42 +435,44 @@ async def a_json_llm__openai(
 
 
 @injected
-async def a_json_llm__gpt4_turbo(
+async def a_json_llm__vicuna(
         a_json_llm__openai,
         /,
         text: str,
-        max_completion_tokens=4096
-) -> str:
+        max_completion_tokens: int = 4096
+) -> dict:
     return await a_json_llm__openai(
         text=text,
         max_completion_tokens=max_completion_tokens,
-        model="gpt-4-turbo-preview"
+        model="llava-1.6-vicuna"  # モデル名を変更
     )
 
 
-test_vision_llm__gpt4 = a_vision_llm__gpt4(
+# テストケース
+test_vision_llm__mistral = a_vision_llm__mistral(
     text="What are inside this image?",
-    images=Injected.list(
-    ),
+    images=Injected.list(),
 )
-"""
-('The image appears to be an advertisement or an informational graphic about '
- 'infant and newborn nutrition. It features a baby with light-colored hair who '
- 'is lying down and holding onto a baby bottle, seemingly feeding themselves. '
- 'The baby is looking directly towards the camera. The image uses a soft pink '
- 'color palette, which is common for baby-related products or information. '
- 'There are texts that read "Infant & Newborn Nutrition" and "Absolutely New," '
- 'along with the word "PINGUIN" at the top, which could be a brand name or '
- "logo. The layout and design of this image suggest it's likely used for "
- 'marketing purposes or as part of educational material regarding baby '
- 'nutrition.')
-"""
 
-test_llm__gpt4_turbo = a_llm__gpt4_turbo(
+test_vision_llm__vicuna = a_vision_llm__vicuna(
+    text="Describe the contents of this image.",
+    images=Injected.list(),
+)
+
+test_llm__mistral = a_llm__mistral(
     "Hello world"
 )
 
-test_json_llm__gpt4_turbo = a_json_llm__gpt4_turbo(
+test_llm__vicuna = a_llm__vicuna(
+    "Hello world"
+)
+
+test_json_llm__mistral = a_json_llm__openai(
+    "Hello world, respond to me in json",
+    model="llava-1.6-mistral"
+)
+
+test_json_llm__vicuna = a_json_llm__vicuna(
     "Hello world, respond to me in json"
 )
 

@@ -1,9 +1,9 @@
 [project]
-name = "pinjected-openai"
+name = "pinjected_localopenai"
 version = "0.4.20a1"
-description = "openai bindings for pinjected library"
+description = "local openai bindings for pinjected library"
 authors = [
-    { name = "proboscis", email = "nameissoap@gmail.com" }
+    { name = "", email = "" }
 ]
 
 dependencies = [
